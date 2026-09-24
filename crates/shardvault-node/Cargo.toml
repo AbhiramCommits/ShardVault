@@ -1,0 +1,11 @@
+[package]
+name = "shardvault-node"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "shardvault-node"
+path = "src/main.rs"
+
+[dependencies]
+shardvault-core = { path = "../shardvault-core" }

@@ -1,0 +1,4 @@
+[package]
+name = "shardvault-ec"
+version.workspace = true
+edition.workspace = true

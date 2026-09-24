@@ -1,0 +1,9 @@
+/target
+*.o
+*.a
+*.dSYM
+csrc/test_block
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
