@@ -1,3 +1,8 @@
-//! Reed-Solomon erasure coding over GF(2^8).
+//! Hand-rolled Reed-Solomon erasure coding over GF(2^8).
 //!
-//! Placeholder crate; implementation lands in a later milestone.
+//! No external coding crates: the field arithmetic, matrix operations, and
+//! encoding/reconstruction are implemented here from scratch.
+
+pub mod gf;
+pub mod matrix;
+pub mod rs;

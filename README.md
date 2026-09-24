@@ -26,6 +26,17 @@ Each block is 4096 bytes: a 24-byte little-endian header followed by up to
 24 bytes. The CRC-32C (Castagnoli, poly 0x82F63B78) covers the header with
 the CRC field zeroed plus the payload.
 
+## Erasure coding
+
+`shardvault-ec` is a hand-rolled Reed-Solomon codec over GF(2^8) (poly
+0x11D), systematic Vandermonde encoding matrix, no external coding crates.
+`shardvault-core` spreads each stripe over simulated node directories as
+C-encoded, CRC-checksummed blocks and reconstructs transparently on read.
+
+Benchmark (`cargo bench -p shardvault-ec`, (10,4), ~1 MiB stripes):
+
+    encode/rs-10-4-1MiB    ~296 MiB/s
+
 ## Building and testing
 
 - `make test-c` — C unit tests (`csrc/test_block.c`)

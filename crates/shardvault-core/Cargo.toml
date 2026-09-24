@@ -3,5 +3,8 @@ name = "shardvault-core"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+shardvault-ec = { path = "../shardvault-ec" }
+
 [build-dependencies]
 cc = "1"

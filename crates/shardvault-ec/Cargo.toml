@@ -2,3 +2,11 @@
 name = "shardvault-ec"
 version.workspace = true
 edition.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "rs_bench"
+harness = false
