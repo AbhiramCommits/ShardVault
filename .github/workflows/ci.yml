@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  c:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run C block tests under ASan+UBSan
+        run: make -C csrc test-san
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1
+
+  fault:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest
+      - run: cargo build -p shardvault-node --features fault-injection
+      - name: Crash matrix, seed 111
+        run: python3 -m pytest harness/ -q --seed 111
+      - name: Crash matrix, seed 222
+        run: python3 -m pytest harness/ -q --seed 222
+      - name: Crash matrix, seed 333
+        run: python3 -m pytest harness/ -q --seed 333
+      - name: Regenerate crash matrix report
+        run: python3 harness/report.py --seed 333
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crash-matrix
+          path: reports/crash_matrix.md
+          if-no-files-found: error
+
+  miri:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly miri setup
+      - name: Miri on the pure-Rust EC modules
+        run: cargo +nightly miri test -p shardvault-ec --lib
+      - name: Miri on core's non-FFI modules (rollup unit tests)
+        run: cargo +nightly miri test -p shardvault-core --lib

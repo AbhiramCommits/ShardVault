@@ -145,39 +145,41 @@ def free_port():
     return port
 
 
-def start_node(datadir, fail_at):
-    """Spawns a single leader node; returns (proc, addr)."""
+def spawn_node(id_, peers, addr, datadir, role, fail_at=None):
+    """Spawns a node; returns (proc, bound_addr)."""
     env = dict(os.environ)
     if fail_at is not None:
         env["SV_FAIL_AT_FSYNC"] = str(fail_at)
     proc = subprocess.Popen(
         [
             str(NODE_BIN),
-            "--id", "0",
-            "--peers", "127.0.0.1:0",
-            "--addr", "127.0.0.1:0",
+            "--id", str(id_),
+            "--peers", ",".join(peers),
+            "--addr", addr,
             "--dir", str(datadir),
-            "--role", "leader",
+            "--role", role,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
     )
-    addr = None
+    bound = None
     deadline = time.time() + 20
     while time.time() < deadline:
         line = proc.stdout.readline()
         if not line:
             if proc.poll() is not None:
                 rest = proc.stdout.read()
-                raise RuntimeError("node exited before listening: %s" % rest.decode(errors="replace"))
+                raise RuntimeError(
+                    "node exited before listening: %s" % rest.decode(errors="replace")
+                )
             time.sleep(0.02)
             continue
         text = line.decode(errors="replace").strip()
         if text.startswith("listening on "):
-            addr = text[len("listening on "):]
+            bound = text[len("listening on "):]
             break
-    if addr is None:
+    if bound is None:
         proc.kill()
         raise RuntimeError("node never reported its listen address")
 
@@ -188,7 +190,12 @@ def start_node(datadir, fail_at):
                 return
 
     threading.Thread(target=drain, daemon=True).start()
-    return proc, addr
+    return proc, bound
+
+
+def start_node(datadir, fail_at):
+    """Spawns a single leader node (harness default); returns (proc, addr)."""
+    return spawn_node(0, ["127.0.0.1:0"], "127.0.0.1:0", datadir, "leader", fail_at)
 
 
 def stop_node(proc):
@@ -290,7 +297,11 @@ def probe_total_fsyncs(seed, workload, workdir):
         client = NodeClient(addr)
         for key, value in workload:
             client.put(key, value)
-        return client.probe_fsyncs()
+        count = client.probe_fsyncs()
+        assert count > 0, (
+            "node reported 0 fsyncs; build it with --features fault-injection"
+        )
+        return count
     finally:
         stop_node(proc)
 

@@ -3,6 +3,7 @@
 *.a
 *.dSYM
 csrc/test_block
+csrc/test_block_san
 __pycache__/
 *.py[cod]
 .pytest_cache/

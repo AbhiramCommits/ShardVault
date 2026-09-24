@@ -7,14 +7,17 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 fn prefixes_of(key: &str) -> Vec<String> {
+    let parts: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
     let mut out = vec![String::new()];
     let mut prefix = String::new();
-    for part in key.split('/').filter(|s| !s.is_empty()) {
-        if !prefix.is_empty() {
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
             prefix.push('/');
         }
         prefix.push_str(part);
-        out.push(prefix.clone());
+        if i + 1 < parts.len() {
+            out.push(prefix.clone());
+        }
     }
     out
 }
