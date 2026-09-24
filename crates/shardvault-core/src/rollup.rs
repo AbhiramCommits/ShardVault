@@ -13,7 +13,7 @@ pub struct Aggregate {
     pub byte_count: u64,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AggDeltaEntry {
     pub prefix: String,
     pub object_count_delta: u64,

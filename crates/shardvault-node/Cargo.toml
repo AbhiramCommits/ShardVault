@@ -3,9 +3,16 @@ name = "shardvault-node"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+shardvault-core = { path = "../shardvault-core", features = ["fault-injection"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+
+[lib]
+name = "shardvault_node"
+path = "src/lib.rs"
+
 [[bin]]
 name = "shardvault-node"
 path = "src/main.rs"
-
-[dependencies]
-shardvault-core = { path = "../shardvault-core" }

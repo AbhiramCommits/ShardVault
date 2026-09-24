@@ -43,7 +43,7 @@ const TAG_COMMIT: u8 = 1;
 const TAG_SEAL: u8 = 2;
 const TAG_AGG: u8 = 3;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Record {
     Put {
         key: String,
@@ -207,18 +207,25 @@ impl Wal {
     /// Appends a record to the in-memory WAL buffer and returns its LSN.
     /// The record is not durable until [`Wal::sync`] is called.
     pub fn append(&mut self, rec: &Record) -> Result<Lsn, StoreError> {
+        let lsn = self.next_lsn;
+        self.append_at(rec, lsn)?;
+        Ok(lsn)
+    }
+
+    /// Appends a record at an explicit LSN (used by followers replicating
+    /// the leader's record sequence).
+    pub fn append_at(&mut self, rec: &Record, lsn: Lsn) -> Result<(), StoreError> {
         let payload = encode_record(rec)?;
         let tag = payload[0];
-        let lsn = self.next_lsn;
         let encoded = match block::encode(lsn, &payload, tag) {
             Ok(b) => b,
             Err(BlockError::Len) => return Err(StoreError::RecordTooLarge),
             Err(e) => return Err(StoreError::Corrupt(format!("block encode failed: {e}"))),
         };
         self.buf.extend_from_slice(&encoded);
-        self.next_lsn += 1;
+        self.next_lsn = self.next_lsn.max(lsn + 1);
         self.dirty = true;
-        Ok(lsn)
+        Ok(())
     }
 
     /// Writes the buffered blocks to the WAL file and fsyncs it.
@@ -227,6 +234,7 @@ impl Wal {
             return Ok(());
         }
         self.file.write_all(&self.buf)?;
+        crate::fault::maybe_fail();
         self.file.sync_data()?;
         self.buf.clear();
         self.dirty = false;
@@ -241,13 +249,40 @@ impl Wal {
     /// discards records after the last durable `Commit`, and returns the
     /// surviving records plus the recovered high-water LSN.
     pub fn replay(path: &Path) -> Result<(Vec<Record>, Lsn), StoreError> {
+        let (records, high_water) = Self::replay_with_lsns(path)?;
+        Ok((
+            records.into_iter().map(|(_, rec)| rec).collect(),
+            high_water,
+        ))
+    }
+
+    /// Like [`Wal::replay`] but keeps each record's block LSN.
+    pub fn replay_with_lsns(path: &Path) -> Result<(Vec<(Lsn, Record)>, Lsn), StoreError> {
+        let mut records = Self::scan(path)?;
+        let mut high_water = 0u64;
+        let mut keep = 0usize;
+        for (i, (_, rec)) in records.iter().enumerate().rev() {
+            if let Record::Commit { lsn } = rec {
+                keep = i + 1;
+                high_water = *lsn;
+                break;
+            }
+        }
+        let last = records.last().map(|(lsn, _)| *lsn).unwrap_or(0);
+        records.truncate(keep);
+        high_water = high_water.max(last);
+        Ok((records, high_water))
+    }
+
+    /// Reads every valid record from the WAL with its block LSN, stopping at
+    /// the first torn or corrupt block. No commit filtering is applied.
+    pub fn scan(path: &Path) -> Result<Vec<(Lsn, Record)>, StoreError> {
         let mut file = match File::open(path) {
             Ok(f) => f,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
         let mut records = Vec::new();
-        let mut last_block_lsn = 0u64;
         loop {
             let mut block = [0u8; block::BLOCK_SIZE];
             let mut filled = 0usize;
@@ -269,24 +304,10 @@ impl Wal {
                 Err(_) => break,
             };
             match decode_record(&decoded.payload) {
-                Ok(rec) => {
-                    last_block_lsn = decoded.lsn;
-                    records.push(rec);
-                }
+                Ok(rec) => records.push((decoded.lsn, rec)),
                 Err(_) => break,
             }
         }
-        let mut high_water = 0u64;
-        let mut keep = 0usize;
-        for (i, rec) in records.iter().enumerate().rev() {
-            if let Record::Commit { lsn } = rec {
-                keep = i + 1;
-                high_water = *lsn;
-                break;
-            }
-        }
-        records.truncate(keep);
-        high_water = high_water.max(last_block_lsn);
-        Ok((records, high_water))
+        Ok(records)
     }
 }

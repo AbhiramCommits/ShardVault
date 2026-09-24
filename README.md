@@ -37,6 +37,36 @@ Benchmark (`cargo bench -p shardvault-ec`, (10,4), ~1 MiB stripes):
 
     encode/rs-10-4-1MiB    ~296 MiB/s
 
+## Replication
+
+`shardvault-node` runs as a leader or follower over TCP (length-prefixed
+bincode frames, `serde`). PUTs flow: leader stages + fsyncs its WAL, ships
+records to followers, waits for a majority of fsync ACKs, commits, and only
+then replies. Followers apply records at the leader's LSNs; lagging
+followers backfill from their `NeedFrom` LSN. Reads are served only up to
+the commit index (read-your-writes), and a PUT never ACKs without a
+durable quorum commit.
+
+```sh
+shardvault-node --id 0 --peers A0,A1,A2 --addr A0 --dir /data/leader --role leader
+shardvault-node --id 1 --peers A0,A1,A2 --addr A1 --dir /data/f1 --role follower
+```
+
+## Fault injection
+
+With the `fault-injection` cargo feature (enabled in `shardvault-node`),
+`SV_FAIL_AT_FSYNC=n` makes the node hard-abort on its nth fsync. The
+Python harness (`harness/`) drives a workload, crashes the node at every
+fsync boundary, and asserts the recovery invariants:
+
+```sh
+cargo build -p shardvault-node
+python3 -m pytest harness/test_crash_recovery.py --seed 12345
+python3 harness/report.py --seed 12345   # writes reports/crash_matrix.md
+```
+
+See `reports/crash_matrix.md` for the latest run (60 boundaries, 0 failures).
+
 ## Building and testing
 
 - `make test-c` — C unit tests (`csrc/test_block.c`)

@@ -5,6 +5,10 @@ edition.workspace = true
 
 [dependencies]
 shardvault-ec = { path = "../shardvault-ec" }
+serde = { version = "1", features = ["derive"] }
+
+[features]
+fault-injection = []
 
 [build-dependencies]
 cc = "1"
