@@ -192,6 +192,30 @@ impl Client {
         }
     }
 
+    fn capacity(&mut self, prefix: &str) -> ((u64, u64), (u64, u64)) {
+        let id = self.next_id;
+        self.next_id += 1;
+        send_frame(
+            &mut self.writer,
+            &Frame::CapacityReq {
+                id,
+                prefix: prefix.to_string(),
+            },
+        )
+        .unwrap();
+        match recv_frame(&mut self.reader).unwrap() {
+            Frame::CapacityOk {
+                id: rid,
+                aggregate,
+                brute,
+            } => {
+                assert_eq!(rid, id);
+                (aggregate, brute)
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     fn status(&mut self) -> (u64, Vec<(u64, u64)>) {
         send_frame(&mut self.writer, &Frame::StatusReq).unwrap();
         match recv_frame(&mut self.reader).unwrap() {
@@ -412,6 +436,16 @@ fn compaction_replicates_and_survives_follower_restart() {
         total_freed += client.compact();
     }
     assert!(total_freed > 0, "compaction must reclaim dead bytes");
+
+    // Rolled-up aggregates must equal the server-side brute-force recount,
+    // even after compaction.
+    for prefix in ["", "obj"] {
+        let (aggregate, brute) = client.capacity(prefix);
+        assert_eq!(
+            aggregate, brute,
+            "capacity(prefix={prefix:?}) diverged from recount"
+        );
+    }
 
     // Read-your-writes still holds after compaction.
     for i in 0..60 {

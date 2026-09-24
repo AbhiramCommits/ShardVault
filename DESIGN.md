@@ -65,11 +65,32 @@ Each invariant names the test that proves it (file, test name).
     `...::three_erasures_recover_with_4_3`,
     `...::three_erasures_fail_with_4_2`.
 
-12. **Aggregate exactness.** Rolled-up prefix aggregates always equal a
+12. **Aggregate exactness.** Rolled-up prefix aggregates count distinct
+    objects (overwrites adjust only byte deltas) and always equal a
     brute-force recount of the surviving objects, both live and after
-    crash recovery.
-    Proved by: `crates/shardvault-core/tests/aggregates.rs::aggregates_match_bruteforce_after_100k_puts`
-    and `harness/test_crash_recovery.py` (aggregate invariant).
+    crash recovery and compaction.
+    Proved by: `crates/shardvault-core/tests/aggregates.rs::aggregates_match_bruteforce_after_100k_puts`,
+    `crates/shardvault-node/tests/replication.rs::compaction_replicates_and_survives_follower_restart`
+    (server-side rollup vs recount), and `harness/test_crash_recovery.py`
+    (aggregate invariant).
+
+13. **Compaction crash-safety.** A crash at any point during compaction
+    leaves either the old or the new segment fully valid; the index never
+    points at a partially rewritten file.
+    Proved by: `crates/shardvault-core/tests/compaction.rs::crash_before_commit_leaves_old_layout`,
+    `...::crash_after_commit_uses_new_layout`, and the crash matrix
+    (compaction fsync boundaries).
+
+14. **Segment id uniqueness.** Compaction replacement ids and the active
+    segment progression share one allocator (`SegmentSeal` carries the
+    next id), so a swap can never alias a live segment.
+    Proved by: `crates/shardvault-core/tests/compaction.rs::sealed_segment_file_is_replaced`
+    and the follower-restart replication test.
+
+15. **Read isolation.** Lock-free readers observe only committed,
+    fully-written values; no torn state is ever visible.
+    Proved by: `crates/shardvault-core/tests/concurrency.rs::concurrent_readers_never_observe_torn_state`
+    (8 readers + 1 writer) and the ThreadSanitizer CI job.
 
 ## Known limitations
 
@@ -81,8 +102,10 @@ Each invariant names the test that proves it (file, test name).
   on a single machine; a host failure would take the whole cluster down,
   and the integration tests exercise process crashes, not network
   partitions or disk failure.
-- **No compaction.** Segments and WAL grow forever; no garbage
-  collection of overwritten object versions exists yet.
+- **Compaction is horizon-gated.** Dead values are reclaimed only below
+  every follower's committed point (min `committed_through`); a follower
+  that stays down forever pins the horizon and no space is reclaimed
+  while it is down. The WAL itself still grows (record history is kept).
 - **WAL amplification.** One record per 4 KiB block means ~8 KiB of WAL
   per PUT (two records); fine for correctness, wasteful for throughput.
 - **Sequential leader.** PUTs are processed one at a time on the leader;
@@ -91,3 +114,7 @@ Each invariant names the test that proves it (file, test name).
 - **Miri does not cover the FFI.** The C block layer runs under
   ASan/UBSan instead; miri checks the pure-Rust modules (gf, matrix,
   rollup).
+- **TSan coverage is Rust-side.** The sanitizer build instruments Rust
+  code; the C static library is linked uninstrumented, so races inside the
+  C layer itself would not be reported (its tables are atomically
+  initialized and it is only called from the writer).

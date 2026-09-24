@@ -69,3 +69,16 @@ jobs:
         run: cargo +nightly miri test -p shardvault-ec --lib
       - name: Miri on core's non-FFI modules (rollup unit tests)
         run: cargo +nightly miri test -p shardvault-core --lib
+
+  tsan:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Concurrency stress test under ThreadSanitizer
+        run: |
+          cargo +nightly rustc -p shardvault-core --test concurrency \
+            -- -Zsanitizer=thread -Cunsafe-allow-abi-mismatch=sanitizer
+          ./target/debug/deps/concurrency-* --test-threads=1

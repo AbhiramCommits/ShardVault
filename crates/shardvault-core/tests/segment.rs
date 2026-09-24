@@ -10,11 +10,12 @@ fn put_get_roundtrip() {
     let id1 = store.put("alpha", b"hello").unwrap();
     let id2 = store.put("beta", b"world!").unwrap();
     let id3 = store.put("alpha", b"overwritten").unwrap();
+    store.put("empty", b"").unwrap();
+    store.flush().unwrap();
     assert!(id1 < id2 && id2 < id3);
     assert_eq!(store.get("alpha").unwrap(), Some(b"overwritten".to_vec()));
     assert_eq!(store.get("beta").unwrap(), Some(b"world!".to_vec()));
     assert_eq!(store.get("gamma").unwrap(), None);
-    store.put("empty", b"").unwrap();
     assert_eq!(store.get("empty").unwrap(), Some(Vec::new()));
 }
 

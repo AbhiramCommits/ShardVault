@@ -86,6 +86,7 @@ struct Leader {
     store: Arc<Mutex<Store>>,
     commit_index: AtomicU64,
     followers: Vec<Arc<FollowerLink>>,
+    failed: Mutex<std::collections::HashSet<u64>>,
     quorum: u64,
     wake: Arc<(Mutex<()>, Condvar)>,
 }
@@ -114,6 +115,7 @@ impl Leader {
             store,
             commit_index,
             followers,
+            failed: Mutex::new(std::collections::HashSet::new()),
             quorum,
             wake: Arc::new((Mutex::new(()), Condvar::new())),
         })
@@ -334,6 +336,10 @@ impl Leader {
 
     fn dialer_loop(self: Arc<Self>, f: Arc<FollowerLink>) {
         loop {
+            if self.failed.lock().unwrap().contains(&f.id) {
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
             let stream = match TcpStream::connect(&f.addr) {
                 Ok(s) => s,
                 Err(_) => {
@@ -456,6 +462,40 @@ impl Leader {
                         }
                     };
                     if send_frame(&mut writer, &resp).is_err() {
+                        return;
+                    }
+                }
+                Frame::ListReq { id, prefix } => {
+                    let keys = self.store.lock().unwrap().keys_with_prefix(&prefix);
+                    let resp = Frame::ListOk { id, keys };
+                    if send_frame(&mut writer, &resp).is_err() {
+                        return;
+                    }
+                }
+                Frame::CapacityReq { id, prefix } => {
+                    let store = self.store.lock().unwrap();
+                    let agg = store.capacity(&prefix);
+                    let keys = store.keys_with_prefix(&prefix);
+                    let brute = keys
+                        .iter()
+                        .fold((0u64, 0u64), |(c, b), (_, len)| (c + 1, b + *len as u64));
+                    let resp = Frame::CapacityOk {
+                        id,
+                        aggregate: (agg.object_count, agg.byte_count),
+                        brute,
+                    };
+                    if send_frame(&mut writer, &resp).is_err() {
+                        return;
+                    }
+                }
+                Frame::SimulateFailure { node_id } => {
+                    self.failed.lock().unwrap().insert(node_id);
+                    for f in &self.followers {
+                        if f.id == node_id {
+                            f.alive.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    if send_frame(&mut writer, &Frame::SimulateFailureDone).is_err() {
                         return;
                     }
                 }

@@ -37,7 +37,7 @@ fn prefixes_of(key: &str) -> Vec<String> {
     out
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Rollup {
     aggregates: HashMap<String, Aggregate>,
     sizes: HashMap<String, u64>,

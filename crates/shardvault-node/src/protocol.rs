@@ -68,6 +68,27 @@ pub enum Frame {
     CompactDone {
         freed: u64,
     }, // 15
+    ListReq {
+        id: u64,
+        prefix: String,
+    }, // 16
+    ListOk {
+        id: u64,
+        keys: Vec<(String, u32)>,
+    }, // 17
+    CapacityReq {
+        id: u64,
+        prefix: String,
+    }, // 18
+    CapacityOk {
+        id: u64,
+        aggregate: (u64, u64),
+        brute: (u64, u64),
+    }, // 19
+    SimulateFailure {
+        node_id: u64,
+    }, // 20
+    SimulateFailureDone, // 21
 }
 
 fn bad_data(e: impl std::fmt::Display) -> io::Error {

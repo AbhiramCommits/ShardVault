@@ -3,8 +3,10 @@
 Append-only, erasure-coded, replicated object store. Objects land in an
 append-only segment store fronted by a write-ahead log (4 KiB checksummed
 blocks from a C11 block layer with software CRC-32C), are replicated
-across nodes via a single-leader log with majority fsync ACKs, and are
-erasure-coded with a hand-rolled Reed-Solomon codec over GF(2^8). A
+across nodes via a single-leader log with majority fsync ACKs, are
+erasure-coded with a hand-rolled Reed-Solomon codec over GF(2^8), and are
+garbage-collected by crash-safe background compaction. Reads are served
+from lock-free committed snapshots, so readers never block on writes. A
 fault-injection harness crashes the node at every fsync boundary and
 proves the recovery invariants hold.
 
@@ -28,15 +30,18 @@ target/release/shardvault-node --id 1 --peers $P --addr 127.0.0.1:17002 --dir /t
 target/release/shardvault-node --id 2 --peers $P --addr 127.0.0.1:17003 --dir /tmp/sv/n2 --role follower &
 target/release/shardvault-node --id 0 --peers $P --addr 127.0.0.1:17001 --dir /tmp/sv/n0 --role leader &
 
-# Put and get an object.
-python3 harness/cli.py --addr 127.0.0.1:17001 put hello world
-python3 harness/cli.py --addr 127.0.0.1:17001 get hello
+# Put and get an object, list and query aggregates (svctl).
+target/release/svctl --addr 127.0.0.1:17001 put hello world
+target/release/svctl --addr 127.0.0.1:17001 get hello
+target/release/svctl --addr 127.0.0.1:17001 ls ns
+target/release/svctl --addr 127.0.0.1:17001 capacity ns
+target/release/svctl --addr 127.0.0.1:17001 node-status
 
-# Kill follower 2, then put and read back: the leader still ACKs (leader +
-# follower 1 = majority) and serves the object.
-kill %2   # or the PID of the follower on 17003
-python3 harness/cli.py --addr 127.0.0.1:17001 put after-crash still-here
-python3 harness/cli.py --addr 127.0.0.1:17001 get after-crash
+# Simulate a follower failure on the leader, then put and read back: the
+# leader still ACKs (leader + follower 1 = majority) and serves the object.
+target/release/svctl --addr 127.0.0.1:17001 simulate-failure 2
+target/release/svctl --addr 127.0.0.1:17001 put after-crash still-here
+target/release/svctl --addr 127.0.0.1:17001 get after-crash
 ```
 
 ## Durability contract
@@ -68,6 +73,30 @@ reconstruct transparently from any k survivors. Measured encode
 throughput (criterion, (10,4), ~1 MiB stripes, this machine):
 
     ~355 MiB/s (2.8 ms per 1 MiB stripe)
+
+## Compaction
+
+Sealed segments are garbage-collected in the background: a segment with
+dead (overwritten) values is rewritten keeping only live values plus dead
+values newer than a safety horizon (the minimum of every follower's
+committed point, so lagging followers can always be backfilled). The
+replacement is written to a temp file, fsynced, renamed into place, and
+described by committed `SegmentSwap`/`SegmentRemap` WAL records — a crash
+at any point leaves either the old or the new segment fully valid, never
+both partially. `svctl` triggers a pass; the node's `Compact` frame does
+the same over the wire, and followers rebuild replacements from their own
+segment copies. The crash matrix exercises compaction fsync boundaries
+alongside PUT fsyncs.
+
+## Concurrency
+
+The store has one writer (all mutating methods hold an internal `RwLock`)
+and lock-free readers: reads load an `arc-swap` snapshot containing the
+committed index, open file handles, and aggregates, so a reader never
+takes a lock and never blocks on fsyncs or compaction. `StoreView` is the
+shareable read handle. An 8-reader/1-writer stress test
+(`crates/shardvault-core/tests/concurrency.rs`) asserts readers only ever
+observe fully written values, and CI runs it under ThreadSanitizer.
 
 ## Rolled-up metadata
 
@@ -101,10 +130,11 @@ durable commit and converges to the leader byte-for-byte.
 ## Crash recovery
 
 The harness (`SV_FAIL_AT_FSYNC=n` aborts the node on its nth fsync)
-enumerates **60 fsync boundaries** (20-put workload) and at each one
-asserts: the store reopens, every ACKed key is present with correct
-bytes, no torn values exist, and aggregates equal a brute-force recount.
-All 60 pass — see [reports/crash_matrix.md](reports/crash_matrix.md).
+enumerates **63 fsync boundaries** (20-put workload with overwrites and
+compaction) and at each one asserts: the store reopens, every ACKed value
+survives (or is superseded by a later committed version), no torn values
+exist, and aggregates equal a brute-force recount of distinct objects.
+All 63 pass — see [reports/crash_matrix.md](reports/crash_matrix.md).
 
 ## Testing
 
@@ -115,7 +145,10 @@ All 60 pass — see [reports/crash_matrix.md](reports/crash_matrix.md).
 | proptest | GF laws (commutativity, distributivity, inverses) | `crates/shardvault-ec/tests/gf_props.rs` |
 | EC erasure matrix | every erasure combination up to m, m+1 fails cleanly | `crates/shardvault-ec/tests/rs.rs` |
 | store integration | WAL/store roundtrip, recovery, torn blocks, stripes | `crates/shardvault-core/tests/` |
-| replication integration | 3-node cluster, kill/restart/catch-up, quorum loss | `crates/shardvault-node/tests/replication.rs` |
+| replication integration | 3-node cluster, kill/restart/catch-up, quorum loss, compaction replication | `crates/shardvault-node/tests/replication.rs` |
+| compaction | reclaim, crash-before/after commit, horizon safety | `crates/shardvault-core/tests/compaction.rs` |
+| concurrency | 8 readers + 1 writer, no torn observations; TSan in CI | `crates/shardvault-core/tests/concurrency.rs` |
+| svctl | put/get/ls/capacity/node-status/simulate-failure smoke-tested | `crates/shardvault-node/src/bin/svctl.rs` |
 | crash matrix | every fsync boundary, 3 seeds in CI | `harness/test_crash_recovery.py` |
 | sanitizers | C block layer under ASan+UBSan | CI job `c` |
 | miri | pure-Rust GF/matrix/rollup under miri | CI job `miri` |

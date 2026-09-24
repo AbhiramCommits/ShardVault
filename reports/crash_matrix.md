@@ -4,8 +4,8 @@
 - workload: 20 puts
 - fsync boundaries enumerated: 63
 - failures: 0
-- generated: 2026-09-24T14:32:41-07:00
-- matrix duration: 9.3s
+- generated: 2026-09-24T14:58:56-07:00
+- matrix duration: 12.2s
 
 | boundary | outcome | recovered objects | aggregate delta |
 | --- | --- | --- | --- |

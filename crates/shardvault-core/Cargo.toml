@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 shardvault-ec = { path = "../shardvault-ec" }
 serde = { version = "1", features = ["derive"] }
+arc-swap = "1"
 
 [features]
 fault-injection = []
