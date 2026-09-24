@@ -107,6 +107,7 @@ TAG_PUT_ERR = 3
 TAG_GET_OK = 5
 TAG_STATUS_OK = 11
 TAG_PROBE_RESP = 13
+TAG_COMPACT_DONE = 15
 
 
 def put_request_body(rid, key, value):
@@ -125,11 +126,18 @@ def probe_request_body():
 
 
 def gen_workload(seed, n):
+    """Deterministic workload with ~30% overwrites so sealed segments
+    accumulate dead values for compaction."""
     rng = random.Random(seed)
     workload = []
+    pool = []
     for i in range(n):
-        key = "ns%02d/s%02d/k%06d" % (i % 5, i % 7, i)
-        value = bytes(rng.getrandbits(8) for _ in range(rng.randrange(0, 500)))
+        if i % 4 == 3 and pool:
+            key = rng.choice(pool)
+        else:
+            key = "ns%02d/s%02d/k%06d" % (i % 5, i % 7, i)
+            pool.append(key)
+        value = bytes(rng.getrandbits(8) for _ in range(rng.randrange(50, 400)))
         workload.append((key, value))
     return workload
 
@@ -148,6 +156,7 @@ def free_port():
 def spawn_node(id_, peers, addr, datadir, role, fail_at=None):
     """Spawns a node; returns (proc, bound_addr)."""
     env = dict(os.environ)
+    env.setdefault("SV_SEGMENT_MAX_BYTES", "2048")
     if fail_at is not None:
         env["SV_FAIL_AT_FSYNC"] = str(fail_at)
     proc = subprocess.Popen(
@@ -260,6 +269,13 @@ class NodeClient:
         n, off = _parse_u64(body, off)
         return body[off : off + n]
 
+    def compact(self):
+        self.sock.sendall(_frame(_u32(14)))
+        body = _recv_frame(self.sock)
+        tag = struct.unpack("<I", body[:4])[0]
+        assert tag == TAG_COMPACT_DONE, "unexpected frame tag %d" % tag
+        return struct.unpack("<Q", body[4:12])[0]
+
     def probe_fsyncs(self):
         self.sock.sendall(_frame(probe_request_body()))
         body = _recv_frame(self.sock)
@@ -295,8 +311,10 @@ def probe_total_fsyncs(seed, workload, workdir):
     proc, addr = start_node(datadir, None)
     try:
         client = NodeClient(addr)
-        for key, value in workload:
+        for i, (key, value) in enumerate(workload):
             client.put(key, value)
+            if i % 8 == 7:
+                client.compact()
         count = client.probe_fsyncs()
         assert count > 0, (
             "node reported 0 fsyncs; build it with --features fault-injection"
@@ -318,7 +336,7 @@ def run_boundary(seed, workload, boundary, workdir):
     acked = {}
     try:
         client = NodeClient(addr)
-        for key, value in workload:
+        for i, (key, value) in enumerate(workload):
             try:
                 if client.put(key, value):
                     acked[key] = value
@@ -326,42 +344,68 @@ def run_boundary(seed, workload, boundary, workdir):
                     break
             except RuntimeError:
                 break
+            if i % 8 == 7:
+                client.compact()
+    except (socket.timeout, ConnectionError, OSError):
+        pass
     finally:
         stop_node(proc)
     report = verify(datadir)
     return acked, report
 
 
+def value_history(workload):
+    """key -> ordered list of every value written for that key."""
+    history = {}
+    for key, value in workload:
+        history.setdefault(key, []).append(value)
+    return history
+
+
 def check_invariants(workload, acked, report):
     """Returns a list of violation strings (empty = all invariants hold)."""
     violations = []
-    expected = dict(workload)
+    history = value_history(workload)
     dump = {entry["key"]: entry for entry in report["keys"]}
 
     # 1. Store opens without error: implied by verify() succeeding.
 
-    # 2. Every ACKed key is present with correct bytes.
+    # 2. Every ACKed value survives: the recovered value for each key must
+    #    be the acked version or a strictly later version that committed
+    #    before the crash (its put was never ACKed).
+    last_acked = {}
     for key, value in acked.items():
+        last_acked[key] = value
+    for key, value in last_acked.items():
         entry = dump.get(key)
         if entry is None:
             violations.append("acked key %s missing after recovery" % key)
-        else:
-            want_crc = "%08x" % crc32c(value)
-            if entry["len"] != len(value) or entry["crc"] != want_crc:
-                violations.append("acked key %s corrupt after recovery" % key)
+            continue
+        seq = history[key]
+        pos = len(seq) - 1 - seq[::-1].index(value)
+        candidates = seq[pos:]
+        match = any(
+            entry["len"] == len(v) and entry["crc"] == "%08x" % crc32c(v)
+            for v in candidates
+        )
+        if not match:
+            violations.append("acked key %s lost after recovery" % key)
 
-    # 3. No torn or partial values: every present key must match its full
-    #    expected value.
+    # 3. No torn or partial values: every present value must be one of the
+    #    full values ever written for that key.
     for key, entry in dump.items():
-        if key not in expected:
+        if key not in history:
             violations.append("unexpected key %s present after recovery" % key)
             continue
-        value = expected[key]
-        want_crc = "%08x" % crc32c(value)
-        if entry["len"] != len(value) or entry["crc"] != want_crc:
+        match = any(
+            entry["len"] == len(v) and entry["crc"] == "%08x" % crc32c(v)
+            for v in history[key]
+        )
+        if not match:
             violations.append("torn or partial value for key %s" % key)
 
-    # 4. Aggregates equal a brute-force recount of surviving objects.
+    # 4. Aggregates equal a brute-force recount of surviving objects
+    #    (distinct keys).
     count = len(dump)
     total_bytes = sum(entry["len"] for entry in dump.values())
     agg = report["aggregate"]

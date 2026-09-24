@@ -22,10 +22,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use shardvault_core::fault;
-use shardvault_core::segment::Store;
+use shardvault_core::segment::{Store, StoreOptions};
 use shardvault_core::wal::{Lsn, Record};
 
 use crate::protocol::{recv_frame, send_frame, Frame, ROLE_FOLLOWER, ROLE_LEADER};
+
+fn store_options() -> StoreOptions {
+    let mut opts = StoreOptions::default();
+    if let Ok(v) = std::env::var("SV_SEGMENT_MAX_BYTES") {
+        if let Ok(n) = v.parse::<u64>() {
+            opts.segment_max_bytes = n;
+        }
+    }
+    opts
+}
 
 pub struct Config {
     pub id: u64,
@@ -60,6 +70,7 @@ struct FollowerLink {
     id: u64,
     addr: String,
     match_index: AtomicU64,
+    committed_through: AtomicU64,
     alive: AtomicBool,
     queue: FrameQueue,
 }
@@ -81,7 +92,7 @@ struct Leader {
 
 impl Leader {
     fn new(cfg: &Config) -> io::Result<Leader> {
-        let store = Store::open(&cfg.dir).map_err(store_err)?;
+        let store = Store::open_with_options(&cfg.dir, store_options()).map_err(store_err)?;
         let store = Arc::new(Mutex::new(store));
         let commit_index = AtomicU64::new(store.lock().unwrap().next_lsn() - 1);
         let quorum = ((cfg.peers.len() + 1) / 2) as u64;
@@ -94,6 +105,7 @@ impl Leader {
                 id: i as u64,
                 addr: addr.clone(),
                 match_index: AtomicU64::new(0),
+                committed_through: AtomicU64::new(0),
                 alive: AtomicBool::new(false),
                 queue: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
             }));
@@ -149,6 +161,47 @@ impl Leader {
         let commit_records = [(commit_block, Record::Commit { lsn: batch_end })];
         self.send_batch(&commit_records, None, commit_block);
         Ok(())
+    }
+
+    fn process_compact(&self) -> Result<u64, String> {
+        let commit_index = self.commit_index.load(Ordering::SeqCst);
+        let horizon = if self.followers.is_empty() {
+            commit_index
+        } else {
+            self.followers
+                .iter()
+                .map(|f| f.committed_through.load(Ordering::SeqCst))
+                .min()
+                .unwrap_or(0)
+        };
+        let staged = {
+            let mut store = self.store.lock().unwrap();
+            match store.compact_stage(horizon).map_err(|e| e.to_string())? {
+                Some(staged) => staged,
+                None => return Ok(0),
+            }
+        };
+        let batch_end = staged.records.last().map(|(lsn, _)| *lsn).unwrap();
+        {
+            let mut store = self.store.lock().unwrap();
+            store.sync_wal().map_err(|e| e.to_string())?;
+        }
+        self.send_batch(&staged.records, None, batch_end);
+        self.await_quorum(batch_end)?;
+        let commit_block;
+        {
+            let mut store = self.store.lock().unwrap();
+            store.commit(batch_end).map_err(|e| e.to_string())?;
+            commit_block = store.next_lsn() - 1;
+        }
+        let freed = {
+            let mut store = self.store.lock().unwrap();
+            store.compact_commit(staged).map_err(|e| e.to_string())?
+        };
+        self.commit_index.store(commit_block, Ordering::SeqCst);
+        let commit_records = [(commit_block, Record::Commit { lsn: batch_end })];
+        self.send_batch(&commit_records, None, commit_block);
+        Ok(freed)
     }
 
     fn await_quorum(&self, batch_end: Lsn) -> Result<(), String> {
@@ -213,15 +266,18 @@ impl Leader {
         frames.push(Frame::SyncBarrier { lsn: commit });
         let (lock, cvar) = &*f.queue;
         let mut q = lock.lock().unwrap();
-        // Drop stale frames covered by the backfill range, but keep live
-        // frames with LSNs above the backfill's commit point — those are
-        // puts that raced ahead of the handshake and must be written after
-        // the backfill records, in LSN order.
-        q.retain(|frame| match frame {
-            Frame::Append { lsn, .. } | Frame::SyncBarrier { lsn } => *lsn > commit,
-            _ => false,
-        });
+        // Live frames with LSNs above the backfill's commit point must be
+        // written AFTER the backfill records, in LSN order; frames at or
+        // below the commit point are covered by the backfill and dropped.
+        let retained: Vec<Frame> = q
+            .drain(..)
+            .filter(|frame| match frame {
+                Frame::Append { lsn, .. } | Frame::SyncBarrier { lsn } => *lsn > commit,
+                _ => false,
+            })
+            .collect();
         q.extend(frames);
+        q.extend(retained);
         cvar.notify_all();
     }
 
@@ -316,7 +372,11 @@ impl Leader {
             let result = (|| loop {
                 match recv_frame(&mut reader) {
                     Ok(Frame::SyncAck { lsn }) => {
-                        f.match_index.store(lsn, Ordering::SeqCst);
+                        f.match_index.fetch_max(lsn, Ordering::SeqCst);
+                        let ci = self.commit_index.load(Ordering::SeqCst);
+                        if lsn >= ci {
+                            f.committed_through.store(ci, Ordering::SeqCst);
+                        }
                         self.notify_ack();
                     }
                     Ok(Frame::NeedFrom { lsn }) => {
@@ -387,6 +447,18 @@ impl Leader {
                         return;
                     }
                 }
+                Frame::Compact => {
+                    let resp = match self.process_compact() {
+                        Ok(freed) => Frame::CompactDone { freed },
+                        Err(msg) => {
+                            eprintln!("shardvault-node: compaction failed: {msg}");
+                            Frame::CompactDone { freed: 0 }
+                        }
+                    };
+                    if send_frame(&mut writer, &resp).is_err() {
+                        return;
+                    }
+                }
                 _ => {}
             }
         }
@@ -406,7 +478,9 @@ struct FollowerRunner {
 
 impl FollowerRunner {
     fn new(dir: &Path) -> io::Result<FollowerRunner> {
-        let store = Arc::new(Mutex::new(Store::open(dir).map_err(store_err)?));
+        let store = Arc::new(Mutex::new(
+            Store::open_with_options(dir, store_options()).map_err(store_err)?,
+        ));
         let (tx, rx) = mpsc::channel::<TcpStream>();
         let runner = FollowerRunner {
             current: Arc::new(Mutex::new(None)),
@@ -453,14 +527,14 @@ fn apply_loop(store: Arc<Mutex<Store>>, rx: mpsc::Receiver<TcpStream>) {
                         break;
                     }
                 }
-                Frame::SyncBarrier { lsn: barrier } => {
+                Frame::SyncBarrier { .. } => {
                     let ack = {
                         let mut store = store.lock().unwrap();
                         if let Err(e) = store.sync_all() {
                             log_err("sync_all", e);
                             break;
                         }
-                        barrier.min(store.applied_upto())
+                        store.applied_upto()
                     };
                     if send_frame(&mut writer, &Frame::SyncAck { lsn: ack }).is_err() {
                         break;

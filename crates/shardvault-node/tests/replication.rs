@@ -26,8 +26,22 @@ impl ChildGuard {
         dir: &std::path::Path,
         role: &str,
     ) -> ChildGuard {
+        Self::spawn_env(id, peers, addr, dir, role, &[])
+    }
+
+    fn spawn_env(
+        id: u64,
+        peers: &[String],
+        addr: &str,
+        dir: &std::path::Path,
+        role: &str,
+        envs: &[(&str, &str)],
+    ) -> ChildGuard {
         let exe = env!("CARGO_BIN_EXE_shardvault-node");
         let mut cmd = Command::new(exe);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
         cmd.args([
             "--id",
             &id.to_string(),
@@ -41,7 +55,7 @@ impl ChildGuard {
             role,
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::inherit());
         ChildGuard(cmd.spawn().unwrap())
     }
 
@@ -166,6 +180,14 @@ impl Client {
                 assert_eq!(rid, id);
                 value
             }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    fn compact(&mut self) -> u64 {
+        send_frame(&mut self.writer, &Frame::Compact).unwrap();
+        match recv_frame(&mut self.reader).unwrap() {
+            Frame::CompactDone { freed } => freed,
             other => panic!("unexpected response: {other:?}"),
         }
     }
@@ -337,4 +359,104 @@ fn put_fails_when_quorum_is_lost() {
     }
 
     leader.kill();
+}
+
+#[test]
+fn compaction_replicates_and_survives_follower_restart() {
+    let dirs = [temp_dir("cp-leader"), temp_dir("cp-f1"), temp_dir("cp-f2")];
+    let placeholder = "127.0.0.1:0".to_string();
+    let envs = [("SV_SEGMENT_MAX_BYTES", "2048")];
+
+    let mut f1 = ChildGuard::spawn_env(
+        1,
+        &[
+            placeholder.clone(),
+            placeholder.clone(),
+            placeholder.clone(),
+        ],
+        "127.0.0.1:0",
+        &dirs[1],
+        "follower",
+        &envs,
+    );
+    let mut f2 = ChildGuard::spawn_env(
+        2,
+        &[
+            placeholder.clone(),
+            placeholder.clone(),
+            placeholder.clone(),
+        ],
+        "127.0.0.1:0",
+        &dirs[2],
+        "follower",
+        &envs,
+    );
+    let f1_addr = f1.wait_listening();
+    let f2_addr = f2.wait_listening();
+
+    let peers = vec!["127.0.0.1:0".to_string(), f1_addr, f2_addr.clone()];
+    let mut leader = ChildGuard::spawn_env(0, &peers, "127.0.0.1:0", &dirs[0], "leader", &envs);
+    let leader_addr = leader.wait_listening();
+
+    let mut client = Client::new(&leader_addr);
+
+    // Overwrites create dead values; small segments seal frequently.
+    for i in 0..300 {
+        let key = format!("obj/{:03}", i % 60);
+        let value = pattern(i as u64);
+        assert!(client.put(&key, &value), "put {i} must ack");
+    }
+
+    let mut total_freed = 0u64;
+    for _ in 0..4 {
+        total_freed += client.compact();
+    }
+    assert!(total_freed > 0, "compaction must reclaim dead bytes");
+
+    // Read-your-writes still holds after compaction.
+    for i in 0..60 {
+        let key = format!("obj/{i:03}");
+        let idx = (0..300).rev().find(|&j| j % 60 == i).unwrap() as u64;
+        assert_eq!(client.get(&key).unwrap(), pattern(idx), "key {key}");
+    }
+
+    // Kill a follower, keep writing, restart it: it must backfill the
+    // compaction records and converge byte-for-byte.
+    f2.kill();
+    for i in 300..380 {
+        let key = format!("obj/{:03}", i % 60);
+        let value = pattern(i as u64);
+        assert!(client.put(&key, &value), "put {i} must ack");
+    }
+    let mut f2 = ChildGuard::spawn_env(2, &peers, &f2_addr, &dirs[2], "follower", &envs);
+    f2.wait_listening();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (commit_index, matches) = client.status();
+        let f2_match = matches
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .map(|(_, m)| *m)
+            .unwrap_or(0);
+        if f2_match >= commit_index {
+            break;
+        }
+        assert!(Instant::now() < deadline, "follower 2 did not catch up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    leader.kill();
+    f1.kill();
+    f2.kill();
+
+    let leader_store = Store::open(&dirs[0]).unwrap();
+    let f2_store = Store::open(&dirs[2]).unwrap();
+    let committed = leader_store.committed_lsn();
+    for key in leader_store.keys() {
+        let l = leader_store.get_upto(&key, committed).unwrap();
+        let f = f2_store.get_upto(&key, f2_store.committed_lsn()).unwrap();
+        assert_eq!(l, f, "key {key} diverged between leader and follower");
+    }
+    assert_eq!(f2_store.capacity(""), leader_store.capacity(""));
 }

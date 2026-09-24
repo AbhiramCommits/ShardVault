@@ -42,6 +42,16 @@ const TAG_PUT: u8 = 0;
 const TAG_COMMIT: u8 = 1;
 const TAG_SEAL: u8 = 2;
 const TAG_AGG: u8 = 3;
+const TAG_SWAP: u8 = 4;
+const TAG_REMAP: u8 = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemapEntry {
+    pub key: String,
+    pub lsn: u64,
+    pub offset: u64,
+    pub len: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Record {
@@ -55,9 +65,18 @@ pub enum Record {
     },
     SegmentSeal {
         segment_id: u64,
+        next_segment_id: u64,
     },
     AggDelta {
         deltas: Vec<AggDeltaEntry>,
+    },
+    SegmentSwap {
+        old_segment_id: u64,
+        new_segment_id: u64,
+    },
+    SegmentRemap {
+        new_segment_id: u64,
+        entries: Vec<RemapEntry>,
     },
 }
 
@@ -84,9 +103,13 @@ fn encode_record(rec: &Record) -> Result<Vec<u8>, StoreError> {
             v.push(TAG_COMMIT);
             v.extend_from_slice(&lsn.to_le_bytes());
         }
-        Record::SegmentSeal { segment_id } => {
+        Record::SegmentSeal {
+            segment_id,
+            next_segment_id,
+        } => {
             v.push(TAG_SEAL);
             v.extend_from_slice(&segment_id.to_le_bytes());
+            v.extend_from_slice(&next_segment_id.to_le_bytes());
         }
         Record::AggDelta { deltas } => {
             let n = u16::try_from(deltas.len()).map_err(|_| StoreError::RecordTooLarge)?;
@@ -98,6 +121,31 @@ fn encode_record(rec: &Record) -> Result<Vec<u8>, StoreError> {
                 v.extend_from_slice(d.prefix.as_bytes());
                 v.extend_from_slice(&d.object_count_delta.to_le_bytes());
                 v.extend_from_slice(&d.byte_count_delta.to_le_bytes());
+            }
+        }
+        Record::SegmentSwap {
+            old_segment_id,
+            new_segment_id,
+        } => {
+            v.push(TAG_SWAP);
+            v.extend_from_slice(&old_segment_id.to_le_bytes());
+            v.extend_from_slice(&new_segment_id.to_le_bytes());
+        }
+        Record::SegmentRemap {
+            new_segment_id,
+            entries,
+        } => {
+            let n = u16::try_from(entries.len()).map_err(|_| StoreError::RecordTooLarge)?;
+            v.push(TAG_REMAP);
+            v.extend_from_slice(&new_segment_id.to_le_bytes());
+            v.extend_from_slice(&n.to_le_bytes());
+            for e in entries {
+                let klen = u16::try_from(e.key.len()).map_err(|_| StoreError::RecordTooLarge)?;
+                v.extend_from_slice(&klen.to_le_bytes());
+                v.extend_from_slice(e.key.as_bytes());
+                v.extend_from_slice(&e.lsn.to_le_bytes());
+                v.extend_from_slice(&e.offset.to_le_bytes());
+                v.extend_from_slice(&e.len.to_le_bytes());
             }
         }
     }
@@ -154,7 +202,11 @@ fn decode_record(payload: &[u8]) -> Result<Record, StoreError> {
         }
         TAG_SEAL => {
             let segment_id = take_u64(&mut p)?;
-            Ok(Record::SegmentSeal { segment_id })
+            let next_segment_id = take_u64(&mut p)?;
+            Ok(Record::SegmentSeal {
+                segment_id,
+                next_segment_id,
+            })
         }
         TAG_AGG => {
             let n = take_u16(&mut p)? as usize;
@@ -171,6 +223,36 @@ fn decode_record(payload: &[u8]) -> Result<Record, StoreError> {
                 });
             }
             Ok(Record::AggDelta { deltas })
+        }
+        TAG_SWAP => {
+            let old_segment_id = take_u64(&mut p)?;
+            let new_segment_id = take_u64(&mut p)?;
+            Ok(Record::SegmentSwap {
+                old_segment_id,
+                new_segment_id,
+            })
+        }
+        TAG_REMAP => {
+            let new_segment_id = take_u64(&mut p)?;
+            let n = take_u16(&mut p)? as usize;
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                let klen = take_u16(&mut p)? as usize;
+                let key = take_utf8(&mut p, klen, "key")?;
+                let lsn = take_u64(&mut p)?;
+                let offset = take_u64(&mut p)?;
+                let len = take_u32(&mut p)?;
+                entries.push(RemapEntry {
+                    key,
+                    lsn,
+                    offset,
+                    len,
+                });
+            }
+            Ok(Record::SegmentRemap {
+                new_segment_id,
+                entries,
+            })
         }
         other => Err(corrupt(&format!("unknown record tag {other}"))),
     }

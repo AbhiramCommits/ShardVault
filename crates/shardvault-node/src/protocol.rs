@@ -64,6 +64,10 @@ pub enum Frame {
     ProbeFsyncResp {
         count: u64,
     }, // 13
+    Compact,   // 14
+    CompactDone {
+        freed: u64,
+    }, // 15
 }
 
 fn bad_data(e: impl std::fmt::Display) -> io::Error {
