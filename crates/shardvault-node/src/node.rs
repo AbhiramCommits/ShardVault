@@ -46,7 +46,7 @@ pub struct Config {
 }
 
 fn store_err(e: shardvault_core::error::StoreError) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 fn log_err(what: &str, e: impl std::fmt::Display) {
@@ -96,7 +96,7 @@ impl Leader {
         let store = Store::open_with_options(&cfg.dir, store_options()).map_err(store_err)?;
         let store = Arc::new(Mutex::new(store));
         let commit_index = AtomicU64::new(store.lock().unwrap().next_lsn() - 1);
-        let quorum = ((cfg.peers.len() + 1) / 2) as u64;
+        let quorum = cfg.peers.len().div_ceil(2) as u64;
         let mut followers = Vec::new();
         for (i, addr) in cfg.peers.iter().enumerate() {
             if i as u64 == cfg.id {
