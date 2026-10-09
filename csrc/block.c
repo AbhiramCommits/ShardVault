@@ -127,7 +127,10 @@ int sv_block_encode(uint8_t out[SV_BLOCK_SIZE], uint64_t lsn,
     sv_put_u64le(out + 0, lsn);
     sv_put_u32le(out + 8, len);
     out[16] = flags;
-    memcpy(out + SV_BLOCK_HEADER_SIZE, payload, len);
+    if (len > 0) {
+        /* memcpy with a NULL source is undefined even for zero bytes */
+        memcpy(out + SV_BLOCK_HEADER_SIZE, payload, len);
+    }
     sv_put_u32le(out + 12, sv_block_checksum(out, len));
     return SV_OK;
 }

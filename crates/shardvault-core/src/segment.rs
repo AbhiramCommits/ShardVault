@@ -46,7 +46,10 @@
 //! segment layouts and LSN sequences match the leader's exactly.
 //! `SegmentSwap`/`SegmentRemap` records are applied by followers by
 //! rebuilding the replacement segment from their own copies of the
-//! values, finalized at the next sync barrier.
+//! values, finalized at the next sync barrier. The replaced segment is
+//! deleted only once a durable `Commit` covers the swap: WAL recovery drops
+//! records after the last commit, so until then the old file is still the
+//! one the recovered WAL references.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -113,6 +116,8 @@ pub struct CompactStage {
 }
 
 struct PendingSwap {
+    /// Block LSN of the `SegmentSwap` record.
+    lsn: Lsn,
     old: u64,
     new: u64,
     file: File,
@@ -137,6 +142,10 @@ struct Inner {
     sealed: Vec<u64>,
     next_free_id: u64,
     pending_swap: Option<PendingSwap>,
+    /// Segments replaced by a finalized follower swap, keyed by the swap's
+    /// block LSN. WAL recovery discards records after the last `Commit`, so
+    /// an old segment stays on disk until a durable `Commit` covers its swap.
+    retired_segments: Vec<(Lsn, u64)>,
 }
 
 struct Snap {
@@ -329,8 +338,23 @@ impl Inner {
         self.segments.insert(swap.new, Arc::new(file));
         self.sealed.retain(|id| *id != swap.old);
         self.sealed.push(swap.new);
-        let _ = fs::remove_file(self.dir.join(seg_name(swap.old)));
+        self.retired_segments.push((swap.lsn, swap.old));
         Ok(())
+    }
+
+    /// Deletes replaced segments whose swap is covered by a durable `Commit`
+    /// record. Call only after the WAL has been synced.
+    fn remove_committed_retired_segments(&mut self) {
+        let durable = self.last_commit_block;
+        let dir = &self.dir;
+        self.retired_segments.retain(|(swap_lsn, old)| {
+            if *swap_lsn <= durable {
+                let _ = fs::remove_file(dir.join(seg_name(*old)));
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -361,6 +385,7 @@ impl Store {
             sealed: Vec::new(),
             next_free_id: 0,
             pending_swap: None,
+            retired_segments: Vec::new(),
         };
         inner.recover(records)?;
         let snap = Arc::new(ArcSwap::from(Arc::new(Snap::from(&inner))));
@@ -694,9 +719,10 @@ impl Store {
                 old_segment_id,
                 new_segment_id,
             } => {
-                if inner.pending_swap.is_some() {
-                    return Err(StoreError::Corrupt("overlapping segment swap".to_string()));
-                }
+                // A backfill can carry several compactions with no sync
+                // barrier in between; the previous swap's remaps are all
+                // applied by now, so finalize it before starting this one.
+                inner.finalize_pending_swap()?;
                 let tmp_path = inner.dir.join(tmp_name(*new_segment_id));
                 let file = OpenOptions::new()
                     .create(true)
@@ -705,6 +731,7 @@ impl Store {
                     .open(&tmp_path)?;
                 inner.wal.append_at(rec, lsn)?;
                 inner.pending_swap = Some(PendingSwap {
+                    lsn,
                     old: *old_segment_id,
                     new: *new_segment_id,
                     file,
@@ -782,6 +809,7 @@ impl Store {
         inner.finalize_pending_swap()?;
         inner.fsync_dirty_segments()?;
         inner.wal.sync()?;
+        inner.remove_committed_retired_segments();
         inner.dirty_segments.clear();
         self.publish(&inner);
         Ok(())

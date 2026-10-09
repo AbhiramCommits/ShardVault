@@ -76,9 +76,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
       - name: Concurrency stress test under ThreadSanitizer
+        # Rebuild std with TSan (-Zbuild-std) so the uninstrumented libtest
+        # harness does not produce false-positive races, and let cargo run the
+        # test binary (its path moved under the nightly build-dir layout).
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
         run: |
-          cargo +nightly rustc -p shardvault-core --test concurrency \
-            -- -Zsanitizer=thread -Cunsafe-allow-abi-mismatch=sanitizer
-          ./target/debug/deps/concurrency-* --test-threads=1
+          cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            -p shardvault-core --test concurrency -- --test-threads=1

@@ -2,6 +2,7 @@ mod common;
 
 use common::TestDir;
 use shardvault_core::segment::{Store, StoreOptions};
+use shardvault_core::wal::Record;
 use std::path::Path;
 
 fn small_opts() -> StoreOptions {
@@ -180,4 +181,153 @@ fn no_eligible_segment_returns_none() {
     store.flush().unwrap();
     let committed = store.committed_lsn();
     assert!(store.compact_stage(committed).unwrap().is_none());
+}
+
+/// Leader WAL records after `after`, with value bytes for `Put`s, as a
+/// follower would receive them.
+fn replication_stream(store: &Store, after: u64) -> Vec<(u64, Record, Option<Vec<u8>>)> {
+    store
+        .scan_wal()
+        .unwrap()
+        .into_iter()
+        .filter(|(lsn, _)| *lsn > after)
+        .map(|(lsn, rec)| {
+            let data = match rec {
+                Record::Put { .. } => Some(store.value_at(lsn).unwrap()),
+                _ => None,
+            };
+            (lsn, rec, data)
+        })
+        .collect()
+}
+
+#[test]
+fn follower_crash_after_swap_sync_before_commit_recovers() {
+    let leader_dir = TestDir::new("compact-follower-leader");
+    let follower_dir = TestDir::new("compact-follower");
+    let opts = small_opts();
+    let mut leader = Store::open_with_options(leader_dir.path(), opts).unwrap();
+    for round in 0..3 {
+        for i in 0..40 {
+            let key = format!("k{i:03}");
+            let value = vec![(i * 7 + round) as u8; 120];
+            leader.put(&key, &value).unwrap();
+        }
+        leader.flush().unwrap();
+    }
+    let base = replication_stream(&leader, 0);
+    let base_end = base.last().unwrap().0;
+    let stage = leader
+        .compact_stage(leader.committed_lsn())
+        .unwrap()
+        .expect("eligible segment");
+    let end_lsn = stage.records.last().map(|(l, _)| *l).unwrap();
+    leader.commit(end_lsn).unwrap();
+    leader.compact_commit(stage).unwrap();
+    let compaction = replication_stream(&leader, base_end);
+    let old_segment = compaction
+        .iter()
+        .find_map(|(_, rec, _)| match rec {
+            Record::SegmentSwap { old_segment_id, .. } => Some(*old_segment_id),
+            _ => None,
+        })
+        .expect("swap record");
+    let old_name = format!("seg-{old_segment:08}.dat");
+
+    let check = |store: &Store| {
+        for i in 0..40 {
+            let key = format!("k{i:03}");
+            let want = vec![(i * 7 + 2) as u8; 120];
+            assert_eq!(store.get(&key).unwrap().unwrap(), want, "key {key}");
+        }
+    };
+
+    {
+        let mut follower = Store::open_with_options(follower_dir.path(), opts).unwrap();
+        for (lsn, rec, data) in &base {
+            follower.apply_record(*lsn, rec, data.as_deref()).unwrap();
+        }
+        follower.sync_all().unwrap();
+        // The leader's sync barrier for the compaction batch arrives before
+        // its Commit record: the swap is synced but not yet committed.
+        for (lsn, rec, data) in &compaction {
+            if !matches!(rec, Record::Commit { .. }) {
+                follower.apply_record(*lsn, rec, data.as_deref()).unwrap();
+            }
+        }
+        follower.sync_all().unwrap();
+        check(&follower);
+        assert!(
+            dir_files(follower_dir.path()).contains(&old_name),
+            "old segment deleted before its swap was committed"
+        );
+        // Crash before the Commit record arrives.
+        std::mem::forget(follower);
+    }
+
+    // Recovery drops the uncommitted swap, so it needs the old segment.
+    let mut follower = Store::open_with_options(follower_dir.path(), opts).unwrap();
+    check(&follower);
+
+    // The leader re-sends the compaction; once committed and synced, the
+    // old segment is gone.
+    let from = follower.last_commit_block();
+    for (lsn, rec, data) in compaction.iter().filter(|(l, _, _)| *l > from) {
+        follower.apply_record(*lsn, rec, data.as_deref()).unwrap();
+    }
+    follower.sync_all().unwrap();
+    check(&follower);
+    assert!(!dir_files(follower_dir.path()).contains(&old_name));
+    drop(follower);
+    let reopened = Store::open_with_options(follower_dir.path(), opts).unwrap();
+    check(&reopened);
+}
+
+#[test]
+fn follower_backfills_consecutive_compactions_without_sync() {
+    let leader_dir = TestDir::new("compact-backfill-leader");
+    let follower_dir = TestDir::new("compact-backfill");
+    let opts = small_opts();
+    let mut leader = Store::open_with_options(leader_dir.path(), opts).unwrap();
+    for round in 0..4 {
+        for i in 0..40 {
+            let key = format!("k{i:03}");
+            let value = vec![(i * 7 + round) as u8; 120];
+            leader.put(&key, &value).unwrap();
+        }
+        leader.flush().unwrap();
+    }
+    let base = replication_stream(&leader, 0);
+    let base_end = base.last().unwrap().0;
+    let mut swaps = 0;
+    for _ in 0..3 {
+        let Some(stage) = leader.compact_stage(leader.committed_lsn()).unwrap() else {
+            break;
+        };
+        let end_lsn = stage.records.last().map(|(l, _)| *l).unwrap();
+        leader.commit(end_lsn).unwrap();
+        leader.compact_commit(stage).unwrap();
+        swaps += 1;
+    }
+    assert!(swaps >= 2, "need at least two compactions, got {swaps}");
+    let compaction = replication_stream(&leader, base_end);
+
+    let mut follower = Store::open_with_options(follower_dir.path(), opts).unwrap();
+    for (lsn, rec, data) in &base {
+        follower.apply_record(*lsn, rec, data.as_deref()).unwrap();
+    }
+    follower.sync_all().unwrap();
+    for (lsn, rec, data) in &compaction {
+        follower.apply_record(*lsn, rec, data.as_deref()).unwrap();
+    }
+    follower.sync_all().unwrap();
+    drop(follower);
+
+    let reopened = Store::open_with_options(follower_dir.path(), opts).unwrap();
+    for i in 0..40 {
+        let key = format!("k{i:03}");
+        let want = vec![(i * 7 + 3) as u8; 120];
+        assert_eq!(reopened.get(&key).unwrap().unwrap(), want, "key {key}");
+    }
+    assert_eq!(reopened.capacity(""), leader.capacity(""));
 }
